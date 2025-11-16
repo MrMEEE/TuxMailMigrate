@@ -1,0 +1,20 @@
+{
+  "source": {
+    "url": "https://carbonio.example.com",
+    "username": "user@example.com",
+    "password": "your-source-password",
+    "principal_path": null
+  },
+  "destination": {
+    "url": "https://mailcow.example.com",
+    "username": "user@example.com",
+    "password": "your-destination-password",
+    "principal_path": null
+  },
+  "options": {
+    "migrate_calendars": true,
+    "migrate_contacts": true,
+    "dry_run": false,
+    "create_collections": true
+  }
+}
