@@ -37,6 +37,7 @@ class MigrationEngine:
             'addressbooks_failed': 0,
             'contacts_migrated': 0,
             'contacts_failed': 0,
+            'contacts_skipped': 0,
         }
         
         # Detailed dry-run information
@@ -83,12 +84,29 @@ class MigrationEngine:
                             # Still process events to count them
                             events = src_calendar.events()
                             event_count = len(events)
+                            
+                            # Count Dummy events if skip_dummy_events is enabled
+                            dummy_count = 0
+                            if self.skip_dummy_events:
+                                for event in events:
+                                    try:
+                                        if hasattr(event, 'instance') and hasattr(event.instance, 'vevent'):
+                                            summary = event.instance.vevent.summary.value if hasattr(event.instance.vevent, 'summary') else ""
+                                            if summary and summary.strip().lower() == "dummy":
+                                                dummy_count += 1
+                                    except:
+                                        pass
+                            
                             self.dry_run_details['calendars'].append({
                                 'name': calendar_name,
                                 'event_count': event_count,
+                                'dummy_count': dummy_count,
                                 'url': str(src_calendar.url)
                             })
-                            self.logger.info(f"  [DRY RUN] Found {event_count} event(s) in '{calendar_name}'")
+                            if dummy_count > 0:
+                                self.logger.info(f"  [DRY RUN] Found {event_count} event(s), {dummy_count} 'Dummy' event(s) would be skipped")
+                            else:
+                                self.logger.info(f"  [DRY RUN] Found {event_count} event(s) in '{calendar_name}'")
                             self.stats['calendars_migrated'] += 1
                             continue
                         else:
@@ -132,18 +150,57 @@ class MigrationEngine:
             if self.dry_run:
                 props = src_calendar.get_properties([caldav.dav.DisplayName()])
                 cal_name = props.get('{DAV:}displayname', 'Unnamed Calendar')
+                
+                # Count Dummy events if skip_dummy_events is enabled
+                dummy_count = 0
+                if self.skip_dummy_events:
+                    for event in events:
+                        try:
+                            if hasattr(event, 'instance') and hasattr(event.instance, 'vevent'):
+                                summary = event.instance.vevent.summary.value if hasattr(event.instance.vevent, 'summary') else ""
+                                if summary and summary.strip().lower() == "dummy":
+                                    dummy_count += 1
+                        except:
+                            pass
+                
                 self.dry_run_details['calendars'].append({
                     'name': cal_name,
                     'event_count': event_count,
+                    'dummy_count': dummy_count,
                     'url': str(src_calendar.url)
                 })
-                self.logger.info(f"  [DRY RUN] Would migrate {event_count} event(s)")
+                if dummy_count > 0:
+                    self.logger.info(f"  [DRY RUN] Found {event_count} event(s), {dummy_count} 'Dummy' event(s) would be skipped")
+                else:
+                    self.logger.info(f"  [DRY RUN] Would migrate {event_count} event(s)")
                 return
+            
+            # Get existing events in destination calendar to check for duplicates
+            existing_uids = set()
+            try:
+                dest_events = dest_calendar.events()
+                for dest_event in dest_events:
+                    try:
+                        if hasattr(dest_event, 'instance') and hasattr(dest_event.instance, 'vevent'):
+                            uid = dest_event.instance.vevent.uid.value
+                            existing_uids.add(uid)
+                    except:
+                        pass
+                self.logger.debug(f"  Found {len(existing_uids)} existing event(s) in destination calendar")
+            except Exception as e:
+                self.logger.debug(f"  Could not retrieve existing events: {e}")
             
             for idx, event in enumerate(events, 1):
                 try:
                     # Get event data (iCalendar format)
                     event_data = event.data
+                    event_uid = event.instance.vevent.uid.value if hasattr(event, 'instance') and hasattr(event.instance, 'vevent') else None
+                    
+                    # Check for duplicate by UID
+                    if event_uid and event_uid in existing_uids:
+                        self.logger.debug(f"    [{idx}/{event_count}] Skipping duplicate event: {event_uid}")
+                        self.stats['events_skipped'] += 1
+                        continue
                     
                     # Check if we should skip this event
                     if self.skip_dummy_events:
@@ -158,11 +215,9 @@ class MigrationEngine:
                         except:
                             pass  # If we can't parse, don't skip
                     
-                    event_uid = event.instance.vevent.uid.value if hasattr(event, 'instance') else f"event_{idx}"
-                    
                     # Add event to destination calendar
                     dest_calendar.save_event(event_data)
-                    self.logger.debug(f"    [{idx}/{event_count}] Migrated event: {event_uid}")
+                    self.logger.debug(f"    [{idx}/{event_count}] Migrated event: {event_uid or f'event_{idx}'}")
                     self.stats['events_migrated'] += 1
                     
                 except Exception as e:
@@ -373,18 +428,43 @@ class MigrationEngine:
                 self.logger.info(f"  [DRY RUN] Would migrate {contact_count} contact(s)")
                 return
             
+            # Get existing contacts in destination addressbook to check for duplicates
+            existing_uids = set()
+            try:
+                dest_contacts = dest_addressbook.objects()
+                for dest_contact in dest_contacts:
+                    try:
+                        if hasattr(dest_contact, 'instance') and hasattr(dest_contact.instance, 'uid'):
+                            uid = dest_contact.instance.uid.value
+                            existing_uids.add(uid)
+                    except:
+                        pass
+                self.logger.debug(f"  Found {len(existing_uids)} existing contact(s) in destination address book")
+            except Exception as e:
+                self.logger.debug(f"  Could not retrieve existing contacts: {e}")
+            
             for idx, contact in enumerate(contacts, 1):
                 try:
                     # Get contact data (vCard format)
                     contact_data = contact.data
                     contact_name = "Unknown"
+                    contact_uid = None
                     
-                    # Try to extract name for better logging
+                    # Try to extract name and UID for better logging and duplicate detection
                     try:
-                        if hasattr(contact, 'instance') and hasattr(contact.instance, 'fn'):
-                            contact_name = contact.instance.fn.value
+                        if hasattr(contact, 'instance'):
+                            if hasattr(contact.instance, 'fn'):
+                                contact_name = contact.instance.fn.value
+                            if hasattr(contact.instance, 'uid'):
+                                contact_uid = contact.instance.uid.value
                     except:
                         pass
+                    
+                    # Check for duplicate by UID
+                    if contact_uid and contact_uid in existing_uids:
+                        self.logger.debug(f"    [{idx}/{contact_count}] Skipping duplicate contact: {contact_name}")
+                        self.stats['contacts_skipped'] += 1
+                        continue
                     
                     # Add contact to destination address book
                     dest_addressbook.save_vcard(contact_data)
@@ -408,6 +488,8 @@ class MigrationEngine:
         self.logger.info(f"  Calendars failed: {self.stats['calendars_failed']}")
         self.logger.info(f"  Events migrated: {self.stats['events_migrated']}")
         self.logger.info(f"  Events failed: {self.stats['events_failed']}")
+        if self.stats['events_skipped'] > 0:
+            self.logger.info(f"  Events skipped (duplicates/filtered): {self.stats['events_skipped']}")
         self.logger.info("=" * 60)
     
     def _log_contact_stats(self):
@@ -418,6 +500,8 @@ class MigrationEngine:
         self.logger.info(f"  Address books failed: {self.stats['addressbooks_failed']}")
         self.logger.info(f"  Contacts migrated: {self.stats['contacts_migrated']}")
         self.logger.info(f"  Contacts failed: {self.stats['contacts_failed']}")
+        if self.stats['contacts_skipped'] > 0:
+            self.logger.info(f"  Contacts skipped (duplicates): {self.stats['contacts_skipped']}")
         self.logger.info("=" * 60)
     
     def get_stats(self) -> Dict[str, Any]:

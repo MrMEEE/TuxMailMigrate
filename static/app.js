@@ -480,6 +480,10 @@ function renderSyncJobCard(job) {
                                 <small class="text-muted">Events</small>
                                 ${stats.dry_run_details && stats.dry_run_details.calendars && stats.dry_run_details.calendars.length > 0 ? `
                                     <div><strong>${stats.dry_run_details.calendars.reduce((sum, cal) => sum + (cal.event_count || 0), 0)}</strong> total</div>
+                                    ${(() => {
+                                        const totalDummy = stats.dry_run_details.calendars.reduce((sum, cal) => sum + (cal.dummy_count || 0), 0);
+                                        return totalDummy > 0 ? `<small class="text-warning" style="font-size: 0.75rem;">⏭️ ${totalDummy} "Dummy" event(s) would be skipped</small>` : '';
+                                    })()}
                                 ` : `
                                     <div><strong>${stats.events_migrated || 0}</strong> / ${(stats.events_migrated || 0) + (stats.events_failed || 0)}</div>
                                 `}

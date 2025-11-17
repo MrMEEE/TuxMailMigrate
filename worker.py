@@ -193,14 +193,22 @@ class SyncWorker:
                     self._add_log(job, 'INFO', "=== DRY RUN SUMMARY ===")
                     
                     total_events = 0
+                    total_dummy_events = 0
                     total_contacts = 0
                     
                     if engine.dry_run_details['calendars']:
                         self._add_log(job, 'INFO', f"📅 Calendars found: {len(engine.dry_run_details['calendars'])}")
                         for cal in engine.dry_run_details['calendars']:
                             total_events += cal['event_count']
-                            self._add_log(job, 'INFO', f"  - {cal['name']}: {cal['event_count']} events")
+                            dummy_count = cal.get('dummy_count', 0)
+                            total_dummy_events += dummy_count
+                            if dummy_count > 0:
+                                self._add_log(job, 'INFO', f"  - {cal['name']}: {cal['event_count']} events ({dummy_count} 'Dummy' events would be skipped)")
+                            else:
+                                self._add_log(job, 'INFO', f"  - {cal['name']}: {cal['event_count']} events")
                         self._add_log(job, 'INFO', f"  Total events: {total_events}")
+                        if total_dummy_events > 0:
+                            self._add_log(job, 'INFO', f"  ⏭️  Total 'Dummy' events that would be skipped: {total_dummy_events}")
                     else:
                         self._add_log(job, 'INFO', "📅 No calendars found")
                     
