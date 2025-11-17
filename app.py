@@ -360,6 +360,23 @@ def start_sync_job(job_id):
     if job.status == 'running':
         return jsonify({'error': 'Job is already running'}), 400
     
+    # Get optional parameters for selective sync
+    data = request.get_json() or {}
+    calendars_only = data.get('calendars_only', False)
+    contacts_only = data.get('contacts_only', False)
+    
+    # Store original settings to restore later
+    original_calendars = job.migrate_calendars
+    original_contacts = job.migrate_contacts
+    
+    # Apply selective sync if requested
+    if calendars_only:
+        job.migrate_calendars = True
+        job.migrate_contacts = False
+    elif contacts_only:
+        job.migrate_calendars = False
+        job.migrate_contacts = True
+    
     # Reset job status
     job.status = 'pending'
     job.progress = 0
@@ -371,8 +388,45 @@ def start_sync_job(job_id):
     # Enqueue the job
     worker.enqueue_job(job_id)
     
+    # Restore original settings after a short delay (they'll be used for display)
+    # The worker will use the current settings when it processes the job
+    if calendars_only or contacts_only:
+        def restore_settings():
+            import time
+            time.sleep(2)  # Wait for worker to pick up the job
+            with app.app_context():
+                j = db.session.get(SyncJob, job_id)
+                if j and j.status != 'pending':  # Only restore if job has started
+                    j.migrate_calendars = original_calendars
+                    j.migrate_contacts = original_contacts
+                    db.session.commit()
+        
+        import threading
+        threading.Thread(target=restore_settings, daemon=True).start()
+    
     logger.info(f"Started sync job: {job.name}")
     return jsonify(job.to_dict())
+
+
+@app.route('/api/sync-jobs/<int:job_id>/cancel', methods=['POST'])
+def cancel_sync_job(job_id):
+    """Cancel a running sync job."""
+    job = db.session.get(SyncJob, job_id)
+    if not job:
+        return jsonify({'error': 'Sync job not found'}), 404
+    
+    if job.status != 'running':
+        return jsonify({'error': 'Job is not running'}), 400
+    
+    if worker.current_job_id != job_id:
+        return jsonify({'error': 'Job is not currently executing'}), 400
+    
+    # Request cancellation
+    if worker.cancel_job():
+        logger.info(f"Cancellation requested for sync job: {job.name}")
+        return jsonify({'message': 'Cancellation requested', 'job': job.to_dict()})
+    else:
+        return jsonify({'error': 'Could not cancel job'}), 500
 
 
 @app.route('/api/sync-jobs/<int:job_id>/pause', methods=['POST'])

@@ -11,7 +11,7 @@ import caldav
 class MigrationEngine:
     """Core migration engine for CalDAV/CardDAV data."""
     
-    def __init__(self, source: CalDAVClient, destination: CalDAVClient, dry_run: bool = False, skip_dummy_events: bool = False):
+    def __init__(self, source: CalDAVClient, destination: CalDAVClient, dry_run: bool = False, skip_dummy_events: bool = False, progress_callback=None):
         """
         Initialize migration engine.
         
@@ -25,6 +25,9 @@ class MigrationEngine:
         self.destination = destination
         self.dry_run = dry_run
         self.skip_dummy_events = skip_dummy_events
+        # Optional callback to report progress while migrating. Called with a dict payload:
+        # { 'stage': 'calendars'|'contacts', 'processed': int, 'total': int, 'skipped': int }
+        self.progress_callback = progress_callback
         self.logger = logging.getLogger(self.__class__.__name__)
         
         self.stats = {
@@ -190,6 +193,7 @@ class MigrationEngine:
             except Exception as e:
                 self.logger.debug(f"  Could not retrieve existing events: {e}")
             
+            processed = 0
             for idx, event in enumerate(events, 1):
                 try:
                     # Get event data (iCalendar format)
@@ -200,6 +204,13 @@ class MigrationEngine:
                     if event_uid and event_uid in existing_uids:
                         self.logger.debug(f"    [{idx}/{event_count}] Skipping duplicate event: {event_uid}")
                         self.stats['events_skipped'] += 1
+                        processed += 1
+                        # report progress
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback({'stage': 'calendars', 'processed': processed, 'total': event_count, 'skipped': self.stats['events_skipped']})
+                            except Exception:
+                                pass
                         continue
                     
                     # Check if we should skip this event
@@ -219,10 +230,23 @@ class MigrationEngine:
                     dest_calendar.save_event(event_data)
                     self.logger.debug(f"    [{idx}/{event_count}] Migrated event: {event_uid or f'event_{idx}'}")
                     self.stats['events_migrated'] += 1
+                    processed += 1
+                    # report progress
+                    if self.progress_callback:
+                        try:
+                            self.progress_callback({'stage': 'calendars', 'processed': processed, 'total': event_count, 'skipped': self.stats['events_skipped']})
+                        except Exception:
+                            pass
                     
                 except Exception as e:
                     self.logger.warning(f"    [{idx}/{event_count}] Failed to migrate event: {str(e)}")
                     self.stats['events_failed'] += 1
+                    processed += 1
+                    if self.progress_callback:
+                        try:
+                            self.progress_callback({'stage': 'calendars', 'processed': processed, 'total': event_count, 'skipped': self.stats['events_skipped']})
+                        except Exception:
+                            pass
             
             if self.skip_dummy_events and self.stats['events_skipped'] > 0:
                 self.logger.info(f"  ⏭  Skipped {self.stats['events_skipped']} 'Dummy' event(s)")
@@ -443,6 +467,7 @@ class MigrationEngine:
             except Exception as e:
                 self.logger.debug(f"  Could not retrieve existing contacts: {e}")
             
+            processed = 0
             for idx, contact in enumerate(contacts, 1):
                 try:
                     # Get contact data (vCard format)
@@ -464,16 +489,34 @@ class MigrationEngine:
                     if contact_uid and contact_uid in existing_uids:
                         self.logger.debug(f"    [{idx}/{contact_count}] Skipping duplicate contact: {contact_name}")
                         self.stats['contacts_skipped'] += 1
+                        processed += 1
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback({'stage': 'contacts', 'processed': processed, 'total': contact_count, 'skipped': self.stats['contacts_skipped']})
+                            except Exception:
+                                pass
                         continue
                     
                     # Add contact to destination address book
                     dest_addressbook.save_vcard(contact_data)
                     self.logger.debug(f"    [{idx}/{contact_count}] Migrated contact: {contact_name}")
                     self.stats['contacts_migrated'] += 1
+                    processed += 1
+                    if self.progress_callback:
+                        try:
+                            self.progress_callback({'stage': 'contacts', 'processed': processed, 'total': contact_count, 'skipped': self.stats['contacts_skipped']})
+                        except Exception:
+                            pass
                     
                 except Exception as e:
                     self.logger.warning(f"    [{idx}/{contact_count}] Failed to migrate contact: {str(e)}")
                     self.stats['contacts_failed'] += 1
+                    processed += 1
+                    if self.progress_callback:
+                        try:
+                            self.progress_callback({'stage': 'contacts', 'processed': processed, 'total': contact_count, 'skipped': self.stats['contacts_skipped']})
+                        except Exception:
+                            pass
             
             self.logger.info(f"  ✓ Migrated {self.stats['contacts_migrated']} contact(s) to '{addressbook_name}'")
                 

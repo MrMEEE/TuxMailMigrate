@@ -514,16 +514,29 @@ function renderSyncJobCard(job) {
                 <div class="d-flex justify-content-between align-items-center">
                     <div class="btn-group btn-group-sm" role="group">
                         ${job.status === 'pending' || job.status === 'completed' || job.status === 'failed' ? `
-                            <button class="btn btn-success" onclick="startSyncJob(${job.id}, false)">
+                            <button class="btn btn-success" onclick="startSyncJob(${job.id}, false)" title="Start full sync">
                                 <i class="bi bi-play-fill"></i> Start
                             </button>
                             <button class="btn btn-outline-info" onclick="startSyncJob(${job.id}, true)" title="Dry run - analyze without copying">
                                 <i class="bi bi-eye"></i> Dry Run
                             </button>
+                            ${job.migrate_calendars ? `
+                                <button class="btn btn-outline-success" onclick="startSyncJob(${job.id}, false, 'calendars')" title="Sync calendars only">
+                                    <i class="bi bi-calendar"></i> Events
+                                </button>
+                            ` : ''}
+                            ${job.migrate_contacts ? `
+                                <button class="btn btn-outline-success" onclick="startSyncJob(${job.id}, false, 'contacts')" title="Sync contacts only">
+                                    <i class="bi bi-person"></i> Contacts
+                                </button>
+                            ` : ''}
                         ` : ''}
                         ${job.status === 'running' ? `
                             <button class="btn btn-warning" onclick="pauseSyncJob(${job.id})">
                                 <i class="bi bi-pause-fill"></i> Pause
+                            </button>
+                            <button class="btn btn-danger" onclick="cancelSyncJob(${job.id})" title="Cancel running sync">
+                                <i class="bi bi-x-circle"></i> Cancel
                             </button>
                         ` : ''}
                         ${job.status === 'paused' ? `
@@ -693,7 +706,7 @@ async function updateSyncJob() {
     }
 }
 
-async function startSyncJob(id, dryRun = false) {
+async function startSyncJob(id, dryRun = false, mode = 'full') {
     try {
         // First update the job with dry_run setting
         if (dryRun) {
@@ -714,14 +727,51 @@ async function startSyncJob(id, dryRun = false) {
             });
         }
         
-        const response = await fetch(`/api/sync-jobs/${id}/start`, {method: 'POST'});
+        // Prepare request body for selective sync
+        const requestBody = {};
+        if (mode === 'calendars') {
+            requestBody.calendars_only = true;
+        } else if (mode === 'contacts') {
+            requestBody.contacts_only = true;
+        }
+        
+        const response = await fetch(`/api/sync-jobs/${id}/start`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(requestBody)
+        });
         
         if (!response.ok) {
             const error = await response.json();
             throw new Error(error.error || 'Failed to start job');
         }
         
-        showAlert(dryRun ? 'Dry run started - analyzing data' : 'Sync job started', 'success');
+        let message = 'Sync job started';
+        if (dryRun) {
+            message = 'Dry run started - analyzing data';
+        } else if (mode === 'calendars') {
+            message = 'Calendar sync started';
+        } else if (mode === 'contacts') {
+            message = 'Contact sync started';
+        }
+        
+        showAlert(message, 'success');
+        loadSyncJobs();
+    } catch (error) {
+        showAlert(error.message, 'danger');
+    }
+}
+
+async function cancelSyncJob(id) {
+    try {
+        const response = await fetch(`/api/sync-jobs/${id}/cancel`, {method: 'POST'});
+        
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to cancel job');
+        }
+        
+        showAlert('Cancellation requested', 'warning');
         loadSyncJobs();
     } catch (error) {
         showAlert(error.message, 'danger');

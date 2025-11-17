@@ -27,6 +27,7 @@ class SyncWorker:
         self.db = db
         self.job_queue = queue.Queue()
         self.current_job_id = None
+        self.cancel_current = False
         self.worker_thread = None
         self.running = False
         self.paused = False
@@ -60,6 +61,14 @@ class SyncWorker:
         """Resume job processing."""
         self.paused = False
         self.logger.info("Worker resumed")
+    
+    def cancel_job(self):
+        """Cancel the currently running job."""
+        if self.current_job_id:
+            self.cancel_current = True
+            self.logger.info(f"Cancel requested for job {self.current_job_id}")
+            return True
+        return False
     
     def enqueue_job(self, job_id: int):
         """
@@ -102,8 +111,10 @@ class SyncWorker:
                 
                 # Process the job
                 self.current_job_id = job_id
+                self.cancel_current = False
                 self._process_job(job_id)
                 self.current_job_id = None
+                self.cancel_current = False
                 
                 self.job_queue.task_done()
                 
@@ -157,12 +168,59 @@ class SyncWorker:
                 job.progress = 20
                 self.db.session.commit()
                 
-                # Create migration engine
+                # Create migration engine with a progress callback so we can update job logs/progress
+                def progress_cb(info: dict):
+                    try:
+                        stage = info.get('stage')
+                        processed = int(info.get('processed', 0))
+                        total = int(info.get('total', 0))
+                        skipped = int(info.get('skipped', 0))
+
+                        # Map stage progress to overall job progress ranges
+                        if stage == 'calendars':
+                            base = 20
+                            rng = 40
+                        elif stage == 'contacts':
+                            base = 60
+                            rng = 30
+                        else:
+                            base = 0
+                            rng = 100
+
+                        pct = base
+                        if total > 0:
+                            pct = base + int(rng * (processed / total))
+
+                        # Update job progress periodically to avoid excessive writes
+                        with self.app.app_context():
+                            j = self.db.session.get(SyncJob, job_id)
+                            if j:
+                                # Only write progress if it's increased or it's the final item
+                                if pct != j.progress or processed == total:
+                                    j.progress = pct
+                                    self.db.session.commit()
+
+                                # Throttle logging: log for small totals every item, otherwise every ~10% or on completion
+                                should_log = False
+                                if total <= 20:
+                                    should_log = True
+                                else:
+                                    step = max(1, total // 10)
+                                    if processed % step == 0 or processed == total:
+                                        should_log = True
+
+                                if should_log:
+                                    msg = f"[{stage}] {processed}/{total} processed, {skipped} skipped"
+                                    self._add_log(j, 'INFO', msg)
+                    except Exception as e:
+                        self.logger.debug(f"Progress callback error: {e}")
+
                 engine = MigrationEngine(
                     source=source,
                     destination=destination,
                     dry_run=job.dry_run,
-                    skip_dummy_events=job.skip_dummy_events
+                    skip_dummy_events=job.skip_dummy_events,
+                    progress_callback=progress_cb
                 )
                 
                 # Log dry-run mode if enabled
@@ -171,12 +229,16 @@ class SyncWorker:
                 
                 # Perform migration
                 if job.migrate_calendars:
+                    if self.cancel_current:
+                        raise Exception("Job cancelled by user")
                     self._add_log(job, 'INFO', "Migrating calendars..." if not job.dry_run else "Analyzing calendars...")
                     engine.migrate_calendars(create_if_missing=job.create_collections)
                     job.progress = 60
                     self.db.session.commit()
                 
                 if job.migrate_contacts:
+                    if self.cancel_current:
+                        raise Exception("Job cancelled by user")
                     self._add_log(job, 'INFO', "Migrating contacts..." if not job.dry_run else "Analyzing contacts...")
                     engine.migrate_contacts(create_if_missing=job.create_collections)
                     job.progress = 90
