@@ -7,6 +7,7 @@ from models import db, ServerConfig, Account, SyncJob, SyncLog
 from worker import get_worker
 import logging
 import os
+import json
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -24,11 +25,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress caldav library's XML parsing warnings for vCard data
+# The caldav library expects XML but CardDAV returns vCard (text/vcard)
+# These warnings don't indicate errors - they're expected behavior
+logging.getLogger('caldav').setLevel(logging.ERROR)
+logging.getLogger('caldav.davclient').setLevel(logging.ERROR)
+# Suppress lxml XML parsing errors (from caldav trying to parse vCard as XML)
+logging.getLogger('lxml').setLevel(logging.ERROR)
+logging.getLogger('lxml.etree').setLevel(logging.ERROR)
+
 
 # Initialize database tables
 with app.app_context():
     db.create_all()
     logger.info("Database initialized")
+    
+    # Reset any jobs that were stuck in 'running' or 'queued' state
+    # This happens when the application shuts down while jobs are active
+    from models import SyncJob
+    stuck_jobs = SyncJob.query.filter(SyncJob.status.in_(['running', 'queued'])).all()
+    if stuck_jobs:
+        logger.info(f"Found {len(stuck_jobs)} job(s) stuck in running/queued state, resetting...")
+        for job in stuck_jobs:
+            job.status = 'failed'
+            job.error_message = 'Job was interrupted by application shutdown'
+            logger.info(f"  Reset job {job.id} ({job.name}) to failed state")
+        db.session.commit()
+        logger.info("All stuck jobs have been reset")
 
 # Initialize worker
 worker = get_worker(app, db)
@@ -274,7 +297,9 @@ def create_sync_job():
         migrate_contacts=data.get('migrate_contacts', True),
         create_collections=data.get('create_collections', True),
         dry_run=data.get('dry_run', False),
-        skip_dummy_events=data.get('skip_dummy_events', False)
+        skip_dummy_events=data.get('skip_dummy_events', False),
+        selected_calendars=json.dumps(data['selected_calendars']) if data.get('selected_calendars') else None,
+        selected_addressbooks=json.dumps(data['selected_addressbooks']) if data.get('selected_addressbooks') else None
     )
     
     db.session.add(job)
@@ -322,6 +347,14 @@ def update_sync_job(job_id):
         job.dry_run = data['dry_run']
     if 'skip_dummy_events' in data:
         job.skip_dummy_events = data['skip_dummy_events']
+    if 'selected_calendars' in data:
+        job.selected_calendars = json.dumps(data['selected_calendars']) if data['selected_calendars'] else None
+    if 'selected_addressbooks' in data:
+        job.selected_addressbooks = json.dumps(data['selected_addressbooks']) if data['selected_addressbooks'] else None
+    if 'calendar_mapping' in data:
+        job.calendar_mapping = json.dumps(data['calendar_mapping']) if data['calendar_mapping'] else None
+    if 'addressbook_mapping' in data:
+        job.addressbook_mapping = json.dumps(data['addressbook_mapping']) if data['addressbook_mapping'] else None
     
     db.session.commit()
     
@@ -410,20 +443,30 @@ def start_sync_job(job_id):
 
 @app.route('/api/sync-jobs/<int:job_id>/cancel', methods=['POST'])
 def cancel_sync_job(job_id):
-    """Cancel a running sync job."""
+    """Cancel a running or queued sync job."""
     job = db.session.get(SyncJob, job_id)
     if not job:
         return jsonify({'error': 'Sync job not found'}), 404
     
-    if job.status != 'running':
-        return jsonify({'error': 'Job is not running'}), 400
+    if job.status not in ('running', 'queued'):
+        return jsonify({'error': 'Job is not running or queued'}), 400
     
+    # If job is queued, just mark it as failed
+    if job.status == 'queued':
+        job.status = 'failed'
+        job.error_message = 'Cancelled by user'
+        job.progress = 0
+        db.session.commit()
+        logger.info(f"Queued sync job cancelled: {job.name}")
+        return jsonify({'message': 'Queued job cancelled', 'job': job.to_dict()})
+    
+    # If running, request cancellation from worker
     if worker.current_job_id != job_id:
         return jsonify({'error': 'Job is not currently executing'}), 400
     
     # Request cancellation
     if worker.cancel_job():
-        logger.info(f"Cancellation requested for sync job: {job.name}")
+        logger.info(f"Cancellation requested for running sync job: {job.name}")
         return jsonify({'message': 'Cancellation requested', 'job': job.to_dict()})
     else:
         return jsonify({'error': 'Could not cancel job'}), 500
@@ -468,6 +511,166 @@ def get_sync_logs(job_id):
     
     logs = SyncLog.query.filter_by(sync_job_id=job_id).order_by(SyncLog.timestamp.desc()).limit(100).all()
     return jsonify([log.to_dict() for log in logs])
+
+
+@app.route('/api/accounts/<int:account_id>/discover', methods=['GET'])
+def discover_collections(account_id):
+    """Discover calendars and addressbooks from an account."""
+    from caldav_client import CalDAVClient
+    
+    account = db.session.get(Account, account_id)
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
+    
+    if not account.server:
+        return jsonify({'error': 'Account has no server configuration'}), 400
+    
+    try:
+        # Create CalDAV client
+        client = CalDAVClient(
+            url=account.server.url,
+            username=account.username,
+            password=account.password,
+            principal_path=account.server.principal_path,
+            verify_ssl=account.server.verify_ssl,
+            server_type=account.server.server_type
+        )
+        
+        # Connect to the server
+        success, error = client.connect()
+        if not success:
+            return jsonify({'error': f'Failed to connect: {error}'}), 400
+        
+        # Get calendars
+        calendars = []
+        try:
+            cal_list = client.get_calendars()
+            for cal in cal_list:
+                import caldav
+                props = cal.get_properties([caldav.dav.DisplayName()])
+                name = props.get('{DAV:}displayname', 'Unnamed Calendar')
+                calendars.append({
+                    'name': name,
+                    'url': str(cal.url)
+                })
+        except Exception as e:
+            logger.warning(f"Failed to get calendars: {e}")
+        
+        # Get addressbooks
+        addressbooks = []
+        try:
+            ab_list = client.get_addressbooks()
+            for ab in ab_list:
+                import caldav
+                props = ab.get_properties([caldav.dav.DisplayName()])
+                name = props.get('{DAV:}displayname', 'Unnamed Address Book')
+                addressbooks.append({
+                    'name': name,
+                    'url': str(ab.url)
+                })
+        except Exception as e:
+            logger.warning(f"Failed to get addressbooks: {e}")
+        
+        return jsonify({
+            'calendars': calendars,
+            'addressbooks': addressbooks
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to discover collections: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sync-jobs/<int:job_id>/discover-both', methods=['GET'])
+def discover_both_accounts(job_id):
+    """Discover calendars and addressbooks from both source and destination accounts."""
+    from caldav_client import CalDAVClient
+    import caldav
+    
+    job = db.session.get(SyncJob, job_id)
+    if not job:
+        return jsonify({'error': 'Sync job not found'}), 404
+    
+    source_account = job.source_account
+    dest_account = job.destination_account
+    
+    if not source_account or not dest_account:
+        return jsonify({'error': 'Source or destination account not found'}), 404
+    
+    result = {
+        'source': {'calendars': [], 'addressbooks': []},
+        'destination': {'calendars': [], 'addressbooks': []}
+    }
+    
+    # Discover from source
+    try:
+        if source_account.server:
+            source_client = CalDAVClient(
+                url=source_account.server.url,
+                username=source_account.username,
+                password=source_account.password,
+                principal_path=source_account.server.principal_path,
+                verify_ssl=source_account.server.verify_ssl,
+                server_type=source_account.server.server_type
+            )
+            success, error = source_client.connect()
+            if success:
+                try:
+                    cal_list = source_client.get_calendars()
+                    for cal in cal_list:
+                        props = cal.get_properties([caldav.dav.DisplayName()])
+                        name = props.get('{DAV:}displayname', 'Unnamed Calendar')
+                        result['source']['calendars'].append({'name': name, 'url': str(cal.url)})
+                except Exception as e:
+                    logger.warning(f"Failed to get source calendars: {e}")
+                
+                try:
+                    ab_list = source_client.get_addressbooks()
+                    for ab in ab_list:
+                        props = ab.get_properties([caldav.dav.DisplayName()])
+                        name = props.get('{DAV:}displayname', 'Unnamed Address Book')
+                        result['source']['addressbooks'].append({'name': name, 'url': str(ab.url)})
+                except Exception as e:
+                    logger.warning(f"Failed to get source addressbooks: {e}")
+    except Exception as e:
+        logger.error(f"Source discovery failed: {e}")
+        result['source']['error'] = str(e)
+    
+    # Discover from destination
+    try:
+        if dest_account.server:
+            dest_client = CalDAVClient(
+                url=dest_account.server.url,
+                username=dest_account.username,
+                password=dest_account.password,
+                principal_path=dest_account.server.principal_path,
+                verify_ssl=dest_account.server.verify_ssl,
+                server_type=dest_account.server.server_type
+            )
+            success, error = dest_client.connect()
+            if success:
+                try:
+                    cal_list = dest_client.get_calendars()
+                    for cal in cal_list:
+                        props = cal.get_properties([caldav.dav.DisplayName()])
+                        name = props.get('{DAV:}displayname', 'Unnamed Calendar')
+                        result['destination']['calendars'].append({'name': name, 'url': str(cal.url)})
+                except Exception as e:
+                    logger.warning(f"Failed to get destination calendars: {e}")
+                
+                try:
+                    ab_list = dest_client.get_addressbooks()
+                    for ab in ab_list:
+                        props = ab.get_properties([caldav.dav.DisplayName()])
+                        name = props.get('{DAV:}displayname', 'Unnamed Address Book')
+                        result['destination']['addressbooks'].append({'name': name, 'url': str(ab.url)})
+                except Exception as e:
+                    logger.warning(f"Failed to get destination addressbooks: {e}")
+    except Exception as e:
+        logger.error(f"Destination discovery failed: {e}")
+        result['destination']['error'] = str(e)
+    
+    return jsonify(result)
 
 
 # ==================== Worker Status ====================

@@ -24,7 +24,7 @@ pip install -q -r requirements-web.txt
 
 # Run database migration if needed
 echo "Checking database migration..."
-python3 migrate_db.py
+python3 migrations/migrate_db.py
 
 echo ""
 echo "Starting web server..."

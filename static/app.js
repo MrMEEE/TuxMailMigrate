@@ -12,6 +12,17 @@ let editAccountModal;
 let addSyncModal;
 let editSyncModal;
 let syncLogsModal;
+let selectCollectionsModal;
+
+// Collection selection state
+let discoveredCollections = {
+    source: {calendars: [], addressbooks: []},
+    destination: {calendars: [], addressbooks: []}
+};
+let selectedCollections = {calendars: [], addressbooks: []};
+let collectionMapping = {calendars: {}, addressbooks: {}};  // Maps source name to destination name
+let currentDiscoverMode = 'add'; // 'add' or 'edit'
+let currentJobId = null; // For edit mode
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
@@ -23,6 +34,7 @@ document.addEventListener('DOMContentLoaded', function() {
     addSyncModal = new bootstrap.Modal(document.getElementById('addSyncModal'));
     editSyncModal = new bootstrap.Modal(document.getElementById('editSyncModal'));
     syncLogsModal = new bootstrap.Modal(document.getElementById('syncLogsModal'));
+    selectCollectionsModal = new bootstrap.Modal(document.getElementById('selectCollectionsModal'));
     
     // Load initial data
     loadServers();
@@ -531,10 +543,7 @@ function renderSyncJobCard(job) {
                                 </button>
                             ` : ''}
                         ` : ''}
-                        ${job.status === 'running' ? `
-                            <button class="btn btn-warning" onclick="pauseSyncJob(${job.id})">
-                                <i class="bi bi-pause-fill"></i> Pause
-                            </button>
+                        ${job.status === 'running' || job.status === 'queued' ? `
                             <button class="btn btn-danger" onclick="cancelSyncJob(${job.id})" title="Cancel running sync">
                                 <i class="bi bi-x-circle"></i> Cancel
                             </button>
@@ -574,6 +583,9 @@ function showAddSyncModal() {
     }
     
     document.getElementById('addSyncForm').reset();
+    // Reset selection state
+    selectedCollections = {calendars: [], addressbooks: []};
+    document.getElementById('selectedCollectionsInfo').style.display = 'none';
     updateSyncAccountSelects();
     addSyncModal.show();
 }
@@ -614,7 +626,9 @@ async function addSyncJob() {
         migrate_calendars: document.getElementById('syncMigrateCalendars').checked,
         migrate_contacts: document.getElementById('syncMigrateContacts').checked,
         create_collections: document.getElementById('syncCreateCollections').checked,
-        skip_dummy_events: document.getElementById('syncSkipDummy').checked
+        skip_dummy_events: document.getElementById('syncSkipDummy').checked,
+        selected_calendars: selectedCollections.calendars.length > 0 ? selectedCollections.calendars : null,
+        selected_addressbooks: selectedCollections.addressbooks.length > 0 ? selectedCollections.addressbooks : null
     };
     
     if (!data.source_id || !data.destination_id) {
@@ -640,6 +654,8 @@ async function addSyncJob() {
         }
         
         addSyncModal.hide();
+        // Reset selection state
+        selectedCollections = {calendars: [], addressbooks: []};
         showAlert('Sync job created successfully', 'success');
         loadSyncJobs();
     } catch (error) {
@@ -660,6 +676,13 @@ async function showEditSyncModal(id) {
     document.getElementById('editSyncCreateCollections').checked = job.create_collections;
     document.getElementById('editSyncSkipDummy').checked = job.skip_dummy_events || false;
     
+    // Load existing selections and mappings
+    selectedCollections.calendars = job.selected_calendars || [];
+    selectedCollections.addressbooks = job.selected_addressbooks || [];
+    collectionMapping.calendars = job.calendar_mapping || {};
+    collectionMapping.addressbooks = job.addressbook_mapping || {};
+    updateSelectedCollectionsInfo();
+    
     updateEditSyncAccountSelects();
     editSyncModal.show();
 }
@@ -673,7 +696,11 @@ async function updateSyncJob() {
         migrate_calendars: document.getElementById('editSyncMigrateCalendars').checked,
         migrate_contacts: document.getElementById('editSyncMigrateContacts').checked,
         create_collections: document.getElementById('editSyncCreateCollections').checked,
-        skip_dummy_events: document.getElementById('editSyncSkipDummy').checked
+        skip_dummy_events: document.getElementById('editSyncSkipDummy').checked,
+        selected_calendars: selectedCollections.calendars.length > 0 ? selectedCollections.calendars : null,
+        selected_addressbooks: selectedCollections.addressbooks.length > 0 ? selectedCollections.addressbooks : null,
+        calendar_mapping: Object.keys(collectionMapping.calendars).length > 0 ? collectionMapping.calendars : null,
+        addressbook_mapping: Object.keys(collectionMapping.addressbooks).length > 0 ? collectionMapping.addressbooks : null
     };
     
     if (!data.source_id || !data.destination_id) {
@@ -937,4 +964,219 @@ function showAlert(message, type = 'info') {
     setTimeout(() => {
         alertDiv.remove();
     }, 5000);
+}
+
+// ==================== Collection Discovery & Selection ====================
+
+async function discoverCollections(mode) {
+    currentDiscoverMode = mode;
+    
+    // Get job ID for edit mode, or check if we have source/dest for add mode
+    if (mode === 'edit') {
+        currentJobId = parseInt(document.getElementById('editSyncId').value);
+        if (!currentJobId) {
+            showAlert('Job ID not found', 'danger');
+            return;
+        }
+    } else {
+        const sourceId = document.getElementById('syncSourceId').value;
+        const destId = document.getElementById('syncDestinationId').value;
+        
+        if (!sourceId || !destId) {
+            showAlert('Please select both source and destination accounts first', 'warning');
+            return;
+        }
+        
+        // For add mode, we need to create a temporary job or use a different endpoint
+        // For now, we'll require the job to be created first
+        showAlert('Please create the job first, then edit it to configure selective sync', 'info');
+        return;
+    }
+    
+    // Show loading state
+    document.getElementById('discoverLoading').style.display = 'block';
+    document.getElementById('discoverError').style.display = 'none';
+    document.getElementById('collectionsContent').style.display = 'none';
+    
+    selectCollectionsModal.show();
+    
+    try {
+        const response = await fetch(`/api/sync-jobs/${currentJobId}/discover-both`);
+        
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to discover collections');
+        }
+        
+        discoveredCollections = await response.json();
+        
+        // Render the collections with mapping
+        renderDiscoveredCollections();
+        
+        // Hide loading, show content
+        document.getElementById('discoverLoading').style.display = 'none';
+        document.getElementById('collectionsContent').style.display = 'block';
+        
+    } catch (error) {
+        console.error('Discovery error:', error);
+        document.getElementById('discoverLoading').style.display = 'none';
+        document.getElementById('discoverError').textContent = error.message;
+        document.getElementById('discoverError').style.display = 'block';
+    }
+}
+
+function renderDiscoveredCollections() {
+    // Render calendars with mapping
+    const calendarsList = document.getElementById('calendarsList');
+    if (discoveredCollections.source && discoveredCollections.source.calendars && discoveredCollections.source.calendars.length > 0) {
+        calendarsList.innerHTML = discoveredCollections.source.calendars.map((cal, idx) => {
+            const isSelected = selectedCollections.calendars.includes(cal.name);
+            const mappedTo = collectionMapping.calendars[cal.name] || '';
+            
+            // Build destination dropdown options
+            let destOptions = '<option value="">Create new calendar</option>';
+            if (discoveredCollections.destination && discoveredCollections.destination.calendars) {
+                discoveredCollections.destination.calendars.forEach(destCal => {
+                    const selected = mappedTo === destCal.name ? 'selected' : '';
+                    destOptions += `<option value="${escapeHtml(destCal.name)}" ${selected}>${escapeHtml(destCal.name)}</option>`;
+                });
+            }
+            
+            return `
+                <tr>
+                    <td class="align-middle">
+                        <input class="form-check-input collection-calendar" type="checkbox" 
+                               value="${escapeHtml(cal.name)}" 
+                               id="cal_${idx}"
+                               ${isSelected ? 'checked' : ''}>
+                    </td>
+                    <td class="align-middle">
+                        <strong>${escapeHtml(cal.name)}</strong>
+                    </td>
+                    <td class="align-middle text-center">
+                        <i class="bi bi-arrow-right"></i>
+                    </td>
+                    <td class="align-middle">
+                        <select class="form-select form-select-sm calendar-mapping" data-source="${escapeHtml(cal.name)}">
+                            ${destOptions}
+                        </select>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    } else {
+        calendarsList.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No calendars found</td></tr>';
+    }
+    
+    // Render addressbooks with mapping
+    const addressbooksList = document.getElementById('addressbooksList');
+    if (discoveredCollections.source && discoveredCollections.source.addressbooks && discoveredCollections.source.addressbooks.length > 0) {
+        addressbooksList.innerHTML = discoveredCollections.source.addressbooks.map((ab, idx) => {
+            const isSelected = selectedCollections.addressbooks.includes(ab.name);
+            const mappedTo = collectionMapping.addressbooks[ab.name] || '';
+            
+            // Build destination dropdown options
+            let destOptions = '<option value="">Create new addressbook</option>';
+            if (discoveredCollections.destination && discoveredCollections.destination.addressbooks) {
+                discoveredCollections.destination.addressbooks.forEach(destAb => {
+                    const selected = mappedTo === destAb.name ? 'selected' : '';
+                    destOptions += `<option value="${escapeHtml(destAb.name)}" ${selected}>${escapeHtml(destAb.name)}</option>`;
+                });
+            }
+            
+            return `
+                <tr>
+                    <td class="align-middle">
+                        <input class="form-check-input collection-addressbook" type="checkbox" 
+                               value="${escapeHtml(ab.name)}" 
+                               id="ab_${idx}"
+                               ${isSelected ? 'checked' : ''}>
+                    </td>
+                    <td class="align-middle">
+                        <strong>${escapeHtml(ab.name)}</strong>
+                    </td>
+                    <td class="align-middle text-center">
+                        <i class="bi bi-arrow-right"></i>
+                    </td>
+                    <td class="align-middle">
+                        <select class="form-select form-select-sm addressbook-mapping" data-source="${escapeHtml(ab.name)}">
+                            ${destOptions}
+                        </select>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    } else {
+        addressbooksList.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No addressbooks found</td></tr>';
+    }
+}
+
+function selectAllCollections(type, checked) {
+    const className = type === 'calendars' ? 'collection-calendar' : 'collection-addressbook';
+    const checkboxes = document.querySelectorAll(`.${className}`);
+    checkboxes.forEach(cb => cb.checked = checked);
+}
+
+function saveCollectionSelection() {
+    // Get selected calendars and their mappings
+    const calendarCheckboxes = document.querySelectorAll('.collection-calendar:checked');
+    selectedCollections.calendars = Array.from(calendarCheckboxes).map(cb => cb.value);
+    
+    // Get calendar mappings
+    collectionMapping.calendars = {};
+    document.querySelectorAll('.calendar-mapping').forEach(select => {
+        const sourceName = select.getAttribute('data-source');
+        const destName = select.value;
+        if (destName) {  // Only save if a destination is selected
+            collectionMapping.calendars[sourceName] = destName;
+        }
+    });
+    
+    // Get selected addressbooks and their mappings
+    const addressbookCheckboxes = document.querySelectorAll('.collection-addressbook:checked');
+    selectedCollections.addressbooks = Array.from(addressbookCheckboxes).map(cb => cb.value);
+    
+    // Get addressbook mappings
+    collectionMapping.addressbooks = {};
+    document.querySelectorAll('.addressbook-mapping').forEach(select => {
+        const sourceName = select.getAttribute('data-source');
+        const destName = select.value;
+        if (destName) {  // Only save if a destination is selected
+            collectionMapping.addressbooks[sourceName] = destName;
+        }
+    });
+    
+    // Update UI to show what's selected
+    updateSelectedCollectionsInfo();
+    
+    // Close modal
+    selectCollectionsModal.hide();
+    
+    const mappingCount = Object.keys(collectionMapping.calendars).length + Object.keys(collectionMapping.addressbooks).length;
+    const mappingText = mappingCount > 0 ? ` (${mappingCount} mapped)` : '';
+    showAlert(`Selected ${selectedCollections.calendars.length} calendar(s) and ${selectedCollections.addressbooks.length} addressbook(s)${mappingText}`, 'success');
+}
+
+function updateSelectedCollectionsInfo() {
+    const infoField = currentDiscoverMode === 'edit' ? 'editSelectedCollectionsInfo' : 'selectedCollectionsInfo';
+    const infoDiv = document.getElementById(infoField);
+    
+    const calCount = selectedCollections.calendars.length;
+    const abCount = selectedCollections.addressbooks.length;
+    
+    if (calCount > 0 || abCount > 0) {
+        let text = 'Selected: ';
+        if (calCount > 0) {
+            text += `${calCount} calendar(s)`;
+        }
+        if (abCount > 0) {
+            if (calCount > 0) text += ', ';
+            text += `${abCount} addressbook(s)`;
+        }
+        infoDiv.textContent = text;
+        infoDiv.style.display = 'block';
+    } else {
+        infoDiv.textContent = 'All collections will be migrated';
+        infoDiv.style.display = 'block';
+    }
 }

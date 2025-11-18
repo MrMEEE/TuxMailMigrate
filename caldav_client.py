@@ -9,6 +9,12 @@ import caldav
 import caldav.objects
 from caldav.lib.error import AuthorizationError, NotFoundError
 
+# Suppress caldav library's XML parsing warnings for vCard data
+# The caldav library expects XML responses but CardDAV returns vCard (text/vcard)
+# This is expected behavior and doesn't indicate an error
+logging.getLogger('caldav').setLevel(logging.ERROR)
+logging.getLogger('caldav.davclient').setLevel(logging.ERROR)
+
 
 class CalDAVClient:
     """Wrapper for CalDAV/CardDAV operations."""
@@ -317,6 +323,44 @@ class CalDAVClient:
             except Exception as e:
                 self.logger.error(f"Failed to retrieve addressbooks via PROPFIND: {type(e).__name__}: {str(e)}")
         
+        # If still no addressbooks found, try common default paths for SOGo/Mailcow
+        if not addressbooks:
+            self.logger.warning("No addressbooks found via PROPFIND, trying default paths")
+            try:
+                principal_url = str(self.principal.url if self.principal else self.url)
+                if not principal_url.endswith('/'):
+                    principal_url += '/'
+                
+                default_paths = ['personal/', 'Personal/', 'addressbook/', 'Addressbook/', 'Contacts/']
+                for path in default_paths:
+                    try:
+                        test_url = principal_url + path
+                        self.logger.debug(f"Trying default addressbook path: {test_url}")
+                        
+                        # Test if this path exists with a simple PROPFIND
+                        propfind_body = '''<?xml version="1.0" encoding="utf-8" ?>
+                        <d:propfind xmlns:d="DAV:">
+                          <d:prop><d:resourcetype /></d:prop>
+                        </d:propfind>'''
+                        
+                        test_response = self.client.request(
+                            url=test_url,
+                            method='PROPFIND',
+                            headers={'Depth': '0', 'Content-Type': 'application/xml; charset=utf-8'},
+                            body=propfind_body
+                        )
+                        
+                        if test_response.status in (200, 207):
+                            ab = caldav.Calendar(client=self.client, url=test_url)
+                            addressbooks.append(ab)
+                            self.logger.info(f"✅ Found default addressbook at {test_url}")
+                            break
+                    except Exception as e:
+                        self.logger.debug(f"Default path {path} not found: {e}")
+                        
+            except Exception as e:
+                self.logger.debug(f"Failed to check default addressbook paths: {e}")
+        
         return addressbooks
     
     def get_addressbook_by_name(self, name: str):
@@ -339,6 +383,18 @@ class CalDAVClient:
                 continue
         return None
     
+    def find_addressbook(self, name: str):
+        """
+        Alias for get_addressbook_by_name for compatibility.
+        
+        Args:
+            name: Display name of the address book
+            
+        Returns:
+            Address book object or None if not found
+        """
+        return self.get_addressbook_by_name(name)
+    
     def create_addressbook(self, name: str, **kwargs):
         """
         Create a new address book.
@@ -351,9 +407,75 @@ class CalDAVClient:
             Created address book object or None if failed
         """
         try:
-            addressbook = self.principal.make_addressbook(name=name, **kwargs)
-            self.logger.info(f"Created address book: {name}")
-            return addressbook
+            # Try to use make_addressbook if available
+            if hasattr(self.principal, 'make_addressbook'):
+                addressbook = self.principal.make_addressbook(name=name, **kwargs)
+                self.logger.info(f"Created address book: {name}")
+                return addressbook
+            else:
+                # Fallback: Create addressbook using MKCOL with CardDAV properties
+                import uuid
+                addressbook_id = name.replace(' ', '-').lower()
+                
+                # Ensure principal URL ends with /
+                principal_url = str(self.principal.url)
+                if not principal_url.endswith('/'):
+                    principal_url += '/'
+                
+                addressbook_url = f"{principal_url}{addressbook_id}/"
+                
+                # Try simple MKCOL first (some servers don't like extended MKCOL)
+                try:
+                    response = self.client.request(
+                        url=addressbook_url,
+                        method='MKCOL',
+                        headers={'Content-Type': 'text/xml; charset=utf-8'}
+                    )
+                    
+                    if response.status in (201, 204, 405):
+                        # If we got 405, the collection might already exist or server doesn't support MKCOL
+                        # Try PROPPATCH to set properties on existing collection
+                        if response.status == 405:
+                            self.logger.debug(f"MKCOL returned 405, trying PROPPATCH on existing collection")
+                        
+                        # Set addressbook properties using PROPPATCH
+                        proppatch_body = f'''<?xml version="1.0" encoding="UTF-8"?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:set>
+    <D:prop>
+      <D:resourcetype>
+        <D:collection/>
+        <C:addressbook/>
+      </D:resourcetype>
+      <D:displayname>{name}</D:displayname>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>'''
+                        
+                        prop_response = self.client.request(
+                            url=addressbook_url,
+                            method='PROPPATCH',
+                            headers={'Content-Type': 'application/xml; charset=utf-8'},
+                            body=proppatch_body
+                        )
+                        
+                        if prop_response.status in (200, 201, 204, 207):
+                            self.logger.info(f"Created address book: {name} at {addressbook_url}")
+                            # Return the addressbook object
+                            import caldav
+                            addressbook = caldav.objects.AddressBook(client=self.client, url=addressbook_url, name=name)
+                            return addressbook
+                        else:
+                            self.logger.error(f"Failed to set addressbook properties '{name}': HTTP {prop_response.status}")
+                            return None
+                    else:
+                        self.logger.error(f"Failed to create address book '{name}': HTTP {response.status}")
+                        return None
+                        
+                except Exception as mkcol_error:
+                    self.logger.error(f"MKCOL/PROPPATCH failed for '{name}': {mkcol_error}")
+                    return None
+                    
         except Exception as e:
             self.logger.error(f"Failed to create address book '{name}': {str(e)}")
             return None

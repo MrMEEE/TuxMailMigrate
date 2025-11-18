@@ -103,6 +103,17 @@ class SyncJob(db.Model):
     dry_run = db.Column(db.Boolean, default=False)
     skip_dummy_events = db.Column(db.Boolean, default=False)
     
+    # Selective sync - JSON arrays of calendar/addressbook names to sync
+    # If null/empty, sync all. If populated, only sync specified ones.
+    selected_calendars = db.Column(db.Text, nullable=True)  # JSON array of calendar names
+    selected_addressbooks = db.Column(db.Text, nullable=True)  # JSON array of addressbook names
+    
+    # Collection mapping - JSON object mapping source names to destination names
+    # Format: {"source_name": "dest_name", ...}
+    # If null, uses same names (default behavior)
+    calendar_mapping = db.Column(db.Text, nullable=True)
+    addressbook_mapping = db.Column(db.Text, nullable=True)
+    
     # Job status
     status = db.Column(db.String(50), default='pending')  # pending, queued, running, paused, completed, failed
     progress = db.Column(db.Integer, default=0)  # 0-100
@@ -135,6 +146,10 @@ class SyncJob(db.Model):
             'create_collections': self.create_collections,
             'dry_run': self.dry_run,
             'skip_dummy_events': self.skip_dummy_events,
+            'selected_calendars': json.loads(self.selected_calendars) if self.selected_calendars else None,
+            'selected_addressbooks': json.loads(self.selected_addressbooks) if self.selected_addressbooks else None,
+            'calendar_mapping': json.loads(self.calendar_mapping) if self.calendar_mapping else None,
+            'addressbook_mapping': json.loads(self.addressbook_mapping) if self.addressbook_mapping else None,
             'status': self.status,
             'progress': self.progress,
             'stats': json.loads(self.stats) if self.stats else {},

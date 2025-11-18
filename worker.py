@@ -5,6 +5,7 @@ Background worker for processing synchronization jobs.
 import threading
 import logging
 import queue
+import json
 from datetime import datetime
 from typing import Optional
 
@@ -215,12 +216,34 @@ class SyncWorker:
                     except Exception as e:
                         self.logger.debug(f"Progress callback error: {e}")
 
+                # Parse selective sync settings
+                selected_cals = json.loads(job.selected_calendars) if job.selected_calendars else None
+                selected_abs = json.loads(job.selected_addressbooks) if job.selected_addressbooks else None
+                
+                # Parse mapping settings
+                cal_mapping = json.loads(job.calendar_mapping) if job.calendar_mapping else None
+                ab_mapping = json.loads(job.addressbook_mapping) if job.addressbook_mapping else None
+                
+                if selected_cals:
+                    self._add_log(job, 'INFO', f"📋 Selective sync: {len(selected_cals)} calendar(s) selected")
+                if selected_abs:
+                    self._add_log(job, 'INFO', f"📋 Selective sync: {len(selected_abs)} addressbook(s) selected")
+                
+                if cal_mapping:
+                    self._add_log(job, 'INFO', f"🗺️ Calendar mapping: {len(cal_mapping)} mapping(s) configured")
+                if ab_mapping:
+                    self._add_log(job, 'INFO', f"🗺️ Addressbook mapping: {len(ab_mapping)} mapping(s) configured")
+                
                 engine = MigrationEngine(
                     source=source,
                     destination=destination,
                     dry_run=job.dry_run,
                     skip_dummy_events=job.skip_dummy_events,
-                    progress_callback=progress_cb
+                    progress_callback=progress_cb,
+                    selected_calendars=selected_cals,
+                    selected_addressbooks=selected_abs,
+                    calendar_mapping=cal_mapping,
+                    addressbook_mapping=ab_mapping
                 )
                 
                 # Log dry-run mode if enabled

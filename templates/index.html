@@ -363,6 +363,12 @@
                             <select class="form-select" id="syncSourceId" required>
                                 <option value="">Select source...</option>
                             </select>
+                            <div class="mt-2">
+                                <button type="button" class="btn btn-sm btn-outline-primary" onclick="discoverCollections('add')" id="discoverBtn">
+                                    <i class="bi bi-search"></i> Discover &amp; Select Collections
+                                </button>
+                                <div id="selectedCollectionsInfo" class="small text-muted mt-1" style="display: none;"></div>
+                            </div>
                         </div>
                         <div class="mb-3">
                             <label class="form-label">Destination Account *</label>
@@ -427,6 +433,12 @@
                             <select class="form-select" id="editSyncSourceId" required>
                                 <option value="">Select source...</option>
                             </select>
+                            <div class="mt-2">
+                                <button type="button" class="btn btn-sm btn-outline-primary" onclick="discoverCollections('edit')" id="editDiscoverBtn">
+                                    <i class="bi bi-search"></i> Discover &amp; Select Collections
+                                </button>
+                                <div id="editSelectedCollectionsInfo" class="small text-muted mt-1" style="display: none;"></div>
+                            </div>
                         </div>
                         <div class="mb-3">
                             <label class="form-label">Destination Account *</label>
@@ -485,6 +497,103 @@
                             <div class="spinner-border" role="status"></div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Select Collections Modal -->
+    <div class="modal fade" id="selectCollectionsModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Select & Map Collections</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="discoverLoading" class="text-center p-4" style="display: none;">
+                        <div class="spinner-border" role="status">
+                            <span class="visually-hidden">Discovering collections...</span>
+                        </div>
+                        <p class="mt-2 text-muted">Discovering collections from source and destination...</p>
+                    </div>
+                    
+                    <div id="discoverError" class="alert alert-danger" style="display: none;"></div>
+                    
+                    <div id="collectionsContent" style="display: none;">
+                        <ul class="nav nav-tabs mb-3" id="collectionTabs" role="tablist">
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link active" id="calendars-tab" data-bs-toggle="tab" data-bs-target="#calendars-pane" type="button">
+                                    <i class="bi bi-calendar"></i> Calendars
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="addressbooks-tab" data-bs-toggle="tab" data-bs-target="#addressbooks-pane" type="button">
+                                    <i class="bi bi-person"></i> Address Books
+                                </button>
+                            </li>
+                        </ul>
+                        
+                        <div class="tab-content" id="collectionTabContent">
+                            <!-- Calendars Tab -->
+                            <div class="tab-pane fade show active" id="calendars-pane" role="tabpanel">
+                                <p class="text-muted small mb-3">
+                                    Select source calendars to migrate and optionally map them to existing destination calendars.
+                                    If no destination is selected, a new calendar with the same name will be created.
+                                </p>
+                                <div class="text-end mb-2">
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="selectAllCollections('calendars', true)">Select All</button>
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="selectAllCollections('calendars', false)">Deselect All</button>
+                                </div>
+                                <div class="table-responsive">
+                                    <table class="table table-sm">
+                                        <thead>
+                                            <tr>
+                                                <th width="50">Sync</th>
+                                                <th>Source Calendar</th>
+                                                <th width="50"></th>
+                                                <th>Destination Calendar</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="calendarsList">
+                                            <tr><td colspan="4" class="text-center text-muted">No calendars found</td></tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            
+                            <!-- Address Books Tab -->
+                            <div class="tab-pane fade" id="addressbooks-pane" role="tabpanel">
+                                <p class="text-muted small mb-3">
+                                    Select source addressbooks to migrate and optionally map them to existing destination addressbooks.
+                                    If no destination is selected, a new addressbook with the same name will be created.
+                                </p>
+                                <div class="text-end mb-2">
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="selectAllCollections('addressbooks', true)">Select All</button>
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="selectAllCollections('addressbooks', false)">Deselect All</button>
+                                </div>
+                                <div class="table-responsive">
+                                    <table class="table table-sm">
+                                        <thead>
+                                            <tr>
+                                                <th width="50">Sync</th>
+                                                <th>Source Address Book</th>
+                                                <th width="50"></th>
+                                                <th>Destination Address Book</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="addressbooksList">
+                                            <tr><td colspan="4" class="text-center text-muted">No addressbooks found</td></tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" onclick="saveCollectionSelection()">Save Selection</button>
                 </div>
             </div>
         </div>

@@ -3,6 +3,8 @@ Migration logic for calendars and contacts.
 """
 
 import logging
+import uuid
+import re
 from typing import Dict, Any, Optional, List
 from caldav_client import CalDAVClient
 import caldav
@@ -11,7 +13,7 @@ import caldav
 class MigrationEngine:
     """Core migration engine for CalDAV/CardDAV data."""
     
-    def __init__(self, source: CalDAVClient, destination: CalDAVClient, dry_run: bool = False, skip_dummy_events: bool = False, progress_callback=None):
+    def __init__(self, source: CalDAVClient, destination: CalDAVClient, dry_run: bool = False, skip_dummy_events: bool = False, progress_callback=None, selected_calendars: List[str] = None, selected_addressbooks: List[str] = None, calendar_mapping: dict = None, addressbook_mapping: dict = None):
         """
         Initialize migration engine.
         
@@ -20,11 +22,19 @@ class MigrationEngine:
             destination: Destination CalDAV client
             dry_run: If True, only simulate migration without making changes
             skip_dummy_events: If True, skip events with summary "Dummy"
+            selected_calendars: List of calendar names to migrate (None = all)
+            selected_addressbooks: List of addressbook names to migrate (None = all)
+            calendar_mapping: Dict mapping source calendar names to destination names (None = use same name)
+            addressbook_mapping: Dict mapping source addressbook names to destination names (None = use same name)
         """
         self.source = source
         self.destination = destination
         self.dry_run = dry_run
         self.skip_dummy_events = skip_dummy_events
+        self.selected_calendars = selected_calendars
+        self.selected_addressbooks = selected_addressbooks
+        self.calendar_mapping = calendar_mapping or {}
+        self.addressbook_mapping = addressbook_mapping or {}
         # Optional callback to report progress while migrating. Called with a dict payload:
         # { 'stage': 'calendars'|'contacts', 'processed': int, 'total': int, 'skipped': int }
         self.progress_callback = progress_callback
@@ -69,6 +79,28 @@ class MigrationEngine:
             self.logger.warning("No calendars found on source server")
             return self.stats
         
+        # Filter calendars if selective sync is enabled
+        if self.selected_calendars is not None:
+            if len(self.selected_calendars) == 0:
+                self.logger.info("Selective sync enabled: 0 calendars selected - skipping all calendars")
+                return self.stats
+            
+            self.logger.info(f"Selective sync enabled: {len(self.selected_calendars)} calendar(s) selected")
+            filtered_calendars = []
+            for cal in source_calendars:
+                props = cal.get_properties([caldav.dav.DisplayName()])
+                cal_name = props.get('{DAV:}displayname', 'Unnamed Calendar')
+                if cal_name in self.selected_calendars:
+                    filtered_calendars.append(cal)
+                else:
+                    self.logger.info(f"Skipping calendar '{cal_name}' (not selected)")
+            source_calendars = filtered_calendars
+            self.logger.info(f"Processing {len(source_calendars)} selected calendar(s)")
+        
+        if not source_calendars:
+            self.logger.warning("No calendars to migrate after filtering")
+            return self.stats
+        
         for src_calendar in source_calendars:
             try:
                 # Get calendar properties
@@ -77,13 +109,18 @@ class MigrationEngine:
                 
                 self.logger.info(f"\nProcessing calendar: '{calendar_name}'")
                 
-                # Get or create destination calendar
-                dest_calendar = self.destination.get_calendar_by_name(calendar_name)
+                # Apply mapping if configured
+                dest_calendar_name = self.calendar_mapping.get(calendar_name, calendar_name)
+                if dest_calendar_name != calendar_name:
+                    self.logger.info(f"  🗺️ Mapping '{calendar_name}' → '{dest_calendar_name}'")
+                
+                # Get or create destination calendar using mapped name
+                dest_calendar = self.destination.get_calendar_by_name(dest_calendar_name)
                 
                 if not dest_calendar:
                     if create_if_missing:
                         if self.dry_run:
-                            self.logger.info(f"  [DRY RUN] Would create calendar: '{calendar_name}'")
+                            self.logger.info(f"  [DRY RUN] Would create calendar: '{dest_calendar_name}'")
                             # Still process events to count them
                             events = src_calendar.events()
                             event_count = len(events)
@@ -101,7 +138,7 @@ class MigrationEngine:
                                         pass
                             
                             self.dry_run_details['calendars'].append({
-                                'name': calendar_name,
+                                'name': dest_calendar_name,
                                 'event_count': event_count,
                                 'dummy_count': dummy_count,
                                 'url': str(src_calendar.url)
@@ -113,10 +150,10 @@ class MigrationEngine:
                             self.stats['calendars_migrated'] += 1
                             continue
                         else:
-                            self.logger.info(f"  Creating calendar: '{calendar_name}'")
-                            dest_calendar = self.destination.create_calendar(calendar_name)
+                            self.logger.info(f"  Creating calendar: '{dest_calendar_name}'")
+                            dest_calendar = self.destination.create_calendar(dest_calendar_name)
                             if not dest_calendar:
-                                self.logger.error(f"  Failed to create calendar: '{calendar_name}'")
+                                self.logger.error(f"  Failed to create calendar: '{dest_calendar_name}'")
                                 self.stats['calendars_failed'] += 1
                                 continue
                     else:
@@ -250,7 +287,7 @@ class MigrationEngine:
             
             if self.skip_dummy_events and self.stats['events_skipped'] > 0:
                 self.logger.info(f"  ⏭  Skipped {self.stats['events_skipped']} 'Dummy' event(s)")
-            self.logger.info(f"  ✓ Migrated {self.stats['events_migrated']} event(s) to '{calendar_name}'")
+            self.logger.info(f"  ✓ Migrated {self.stats['events_migrated']} event(s) to '{dest_calendar_name}'")
                 
         except Exception as e:
             self.logger.error(f"  Failed to retrieve events: {str(e)}")
@@ -269,10 +306,34 @@ class MigrationEngine:
         self.logger.info("Starting contact migration...")
         self.logger.info("=" * 60)
         
+        # Check if addressbooks are selected BEFORE retrieving them
+        if self.selected_addressbooks is not None:
+            if len(self.selected_addressbooks) == 0:
+                self.logger.info("Selective sync enabled: 0 addressbooks selected - skipping all addressbooks")
+                return self.stats
+        
         source_addressbooks = self.source.get_addressbooks()
         
         if not source_addressbooks:
             self.logger.warning("No address books found on source server")
+            return self.stats
+        
+        # Filter addressbooks if selective sync is enabled
+        if self.selected_addressbooks is not None:
+            self.logger.info(f"Selective sync enabled: {len(self.selected_addressbooks)} addressbook(s) selected")
+            filtered_addressbooks = []
+            for ab in source_addressbooks:
+                props = ab.get_properties([caldav.dav.DisplayName()])
+                ab_name = props.get('{DAV:}displayname', 'Unnamed Address Book')
+                if ab_name in self.selected_addressbooks:
+                    filtered_addressbooks.append(ab)
+                else:
+                    self.logger.info(f"Skipping addressbook '{ab_name}' (not selected)")
+            source_addressbooks = filtered_addressbooks
+            self.logger.info(f"Processing {len(source_addressbooks)} selected addressbook(s)")
+        
+        if not source_addressbooks:
+            self.logger.warning("No addressbooks to migrate after filtering")
             return self.stats
         
         for src_addressbook in source_addressbooks:
@@ -283,13 +344,18 @@ class MigrationEngine:
                 
                 self.logger.info(f"\nProcessing address book: '{addressbook_name}'")
                 
-                # Get or create destination address book
-                dest_addressbook = self.destination.get_addressbook_by_name(addressbook_name)
+                # Apply mapping if configured
+                dest_addressbook_name = self.addressbook_mapping.get(addressbook_name, addressbook_name)
+                if dest_addressbook_name != addressbook_name:
+                    self.logger.info(f"  🗺️ Mapping '{addressbook_name}' → '{dest_addressbook_name}'")
+                
+                # Get or create destination address book using mapped name
+                dest_addressbook = self.destination.get_addressbook_by_name(dest_addressbook_name)
                 
                 if not dest_addressbook:
                     if create_if_missing:
                         if self.dry_run:
-                            self.logger.info(f"  [DRY RUN] Would create address book: '{addressbook_name}'")
+                            self.logger.info(f"  [DRY RUN] Would create address book: '{dest_addressbook_name}'")
                             # Still process contacts to count them
                             contact_count = 0
                             try:
@@ -352,7 +418,7 @@ class MigrationEngine:
                                 self.logger.warning(f"  Could not count contacts in '{addressbook_name}': {e}")
                                 contact_count = 0
                             self.dry_run_details['addressbooks'].append({
-                                'name': addressbook_name,
+                                'name': dest_addressbook_name,
                                 'contact_count': contact_count,
                                 'url': str(src_addressbook.url)
                             })
@@ -360,16 +426,38 @@ class MigrationEngine:
                             self.stats['addressbooks_migrated'] += 1
                             continue
                         else:
-                            self.logger.info(f"  Creating address book: '{addressbook_name}'")
-                            dest_addressbook = self.destination.create_addressbook(addressbook_name)
+                            # Real migration - try to find or create addressbook
+                            self.logger.info(f"  Looking for address book: '{dest_addressbook_name}' on destination")
+                            dest_addressbook = self.destination.find_addressbook(dest_addressbook_name)
                             if not dest_addressbook:
-                                self.logger.error(f"  Failed to create address book: '{addressbook_name}'")
-                                self.stats['addressbooks_failed'] += 1
-                                continue
-                    else:
-                        self.logger.warning(f"  Address book '{addressbook_name}' not found on destination (skipping)")
+                                if create_if_missing:
+                                    self.logger.info(f"  Address book '{dest_addressbook_name}' not found, attempting to create it...")
+                                    dest_addressbook = self.destination.create_addressbook(dest_addressbook_name)
+                                    if not dest_addressbook:
+                                        self.logger.error(f"  ✗ Failed to create address book '{dest_addressbook_name}'")
+                                        self.logger.warning(f"  SOGo may not support creating addressbooks via CardDAV API")
+                                        self.logger.warning(f"  Skipping this addressbook. Please create it manually in SOGo.")
+                                        self.stats['addressbooks_failed'] += 1
+                                        continue
+                                    else:
+                                        self.logger.info(f"  ✓ Successfully created address book '{dest_addressbook_name}'")
+                                else:
+                                    # create_if_missing is False - skip this addressbook
+                                    self.logger.warning(f"  Address book '{dest_addressbook_name}' not found on destination")
+                                    self.logger.warning(f"  Skipping (create_if_missing=False)")
+                                    self.stats['addressbooks_failed'] += 1
+                                    continue
+                            else:
+                                self.logger.info(f"  ✓ Found existing address book '{dest_addressbook_name}' on destination")
+                else:
+                    # create_if_missing is False and addressbook doesn't exist
+                    if not dest_addressbook:
+                        self.logger.warning(f"  Address book '{dest_addressbook_name}' not found (create_if_missing=False)")
                         self.stats['addressbooks_failed'] += 1
                         continue
+                    else:
+                        # Addressbook found on destination
+                        self.logger.info(f"  Found address book '{dest_addressbook_name}' on destination")
                 
                 # Migrate contacts
                 self._migrate_addressbook_contacts(src_addressbook, dest_addressbook, addressbook_name)
@@ -392,37 +480,74 @@ class MigrationEngine:
             addressbook_name: Name of the address book (for logging)
         """
         try:
-            # Get all contacts (vCards) - try REPORT first for Carbonio/CardDAV
+            # Get all contacts (vCards) - use PROPFIND which works reliably for Carbonio
             contacts = []
             try:
-                # Try REPORT method for CardDAV
-                report_body = '''<?xml version="1.0" encoding="utf-8" ?>
-                <C:addressbook-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
-                  <D:prop>
-                    <D:getetag/>
-                    <C:address-data/>
-                  </D:prop>
-                </C:addressbook-query>'''
+                # Use PROPFIND to list all vCard resources
+                import xml.etree.ElementTree as ET
+                propfind_body = '''<?xml version="1.0" encoding="utf-8" ?>
+                <d:propfind xmlns:d="DAV:">
+                  <d:prop>
+                    <d:getetag/>
+                    <d:getcontenttype/>
+                  </d:prop>
+                </d:propfind>'''
                 
                 response = self.source.client.request(
                     url=str(src_addressbook.url),
-                    method='REPORT',
+                    method='PROPFIND',
                     headers={'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8'},
-                    body=report_body
+                    body=propfind_body
                 )
                 
-                # Parse response to get contacts
-                import xml.etree.ElementTree as ET
+                # Parse response to get vCard URLs
                 response_text = response.raw if isinstance(response.raw, str) else response.raw.decode('utf-8')
                 root = ET.fromstring(response_text)
-                ns = {'d': 'DAV:', 'c': 'urn:ietf:params:xml:ns:carddav'}
+                ns = {'d': 'DAV:'}
                 
-                # Count responses (each is a contact)
-                responses = root.findall('.//d:response', ns)
-                contacts = responses  # Use responses as contact list for counting
-                self.logger.debug(f"  REPORT returned {len(contacts)} contacts")
-            except Exception as e_report:
-                self.logger.debug(f"  REPORT failed: {e_report}, trying other methods...")
+                # Find all resources with content-type text/vcard
+                for response_elem in root.findall('.//d:response', ns):
+                    contenttype = response_elem.find('.//d:getcontenttype', ns)
+                    if contenttype is not None and contenttype.text and 'vcard' in contenttype.text.lower():
+                        href = response_elem.find('.//d:href', ns)
+                        if href is not None and href.text:
+                            # Create a simple object to hold the vCard URL
+                            class VCardRef:
+                                def __init__(self, url, parent_client):
+                                    self.url = url
+                                    self.client = parent_client
+                                    self._data = None
+                                    self._instance = None
+                                
+                                @property
+                                def data(self):
+                                    if self._data is None:
+                                        # Fetch the vCard data
+                                        resp = self.client.request(url=self.url, method='GET')
+                                        self._data = resp.raw if isinstance(resp.raw, str) else resp.raw.decode('utf-8')
+                                    return self._data
+                                
+                                @property
+                                def instance(self):
+                                    if self._instance is None:
+                                        try:
+                                            import vobject
+                                            self._instance = vobject.readOne(self.data)
+                                        except:
+                                            pass
+                                    return self._instance
+                            
+                            vcard_url = href.text
+                            if not vcard_url.startswith('http'):
+                                from urllib.parse import urljoin
+                                vcard_url = urljoin(str(src_addressbook.url), vcard_url)
+                            
+                            contacts.append(VCardRef(vcard_url, self.source.client))
+                
+                self.logger.info(f"  PROPFIND returned {len(contacts)} contacts")
+            except Exception as e_propfind:
+                self.logger.warning(f"  PROPFIND failed: {e_propfind}, trying caldav library methods...")
+                # Fallback to standard caldav methods
                 try:
                     contacts = src_addressbook.objects()
                 except Exception as e1:
@@ -434,7 +559,7 @@ class MigrationEngine:
                             contacts = result[1] if isinstance(result, tuple) else result
                             contacts = contacts if contacts else []
                         except Exception as e3:
-                            self.logger.warning(f"  All contact retrieval methods failed: REPORT={e_report}, objects()={e1}, search()={e2}, sync_token()={e3}")
+                            self.logger.warning(f"  All contact retrieval methods failed: PROPFIND={e_propfind}, objects()={e1}, search()={e2}, sync_token()={e3}")
                             contacts = []
             
             contact_count = len(contacts)
@@ -498,8 +623,43 @@ class MigrationEngine:
                         continue
                     
                     # Add contact to destination address book
-                    dest_addressbook.save_vcard(contact_data)
-                    self.logger.debug(f"    [{idx}/{contact_count}] Migrated contact: {contact_name}")
+                    # SOGo requires PUT to /Contacts/personal/{uid}.vcf (not just /Contacts/{uid}.vcf)
+                    try:
+                        # Get the addressbook URL
+                        addressbook_url = str(dest_addressbook.url).rstrip('/')
+                        
+                        # Extract UID from vCard
+                        vcard_uid = contact.uid.value if hasattr(contact, 'uid') and hasattr(contact.uid, 'value') else None
+                        if not vcard_uid:
+                            uid_match = re.search(r'UID:([^\r\n]+)', contact_data)
+                            vcard_uid = uid_match.group(1) if uid_match else str(uuid.uuid4())
+                        
+                        # Create safe filename from UID
+                        safe_uid = vcard_uid.replace(':', '_').replace('/', '_')
+                        
+                        # SOGo requires /Contacts/personal/ path (not just /Contacts/)
+                        # If URL ends with /Contacts, append /personal
+                        if addressbook_url.endswith('/Contacts'):
+                            vcard_url = f"{addressbook_url}/personal/{safe_uid}.vcf"
+                        else:
+                            vcard_url = f"{addressbook_url}/{safe_uid}.vcf"
+                        
+                        # PUT request with vCard data
+                        import requests
+                        response = requests.put(
+                            vcard_url,
+                            data=contact_data.encode('utf-8'),
+                            headers={'Content-Type': 'text/vcard; charset=utf-8'},
+                            auth=(self.destination.username, self.destination.password),
+                            verify=False
+                        )
+                        
+                        if response.status_code in (200, 201, 204):
+                            self.logger.debug(f"    [{idx}/{contact_count}] Migrated contact: {contact_name} (status: {response.status_code})")
+                        else:
+                            raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+                    except Exception as save_err:
+                        raise Exception(f"Failed to save contact: {str(save_err)}")
                     self.stats['contacts_migrated'] += 1
                     processed += 1
                     if self.progress_callback:
@@ -518,7 +678,7 @@ class MigrationEngine:
                         except Exception:
                             pass
             
-            self.logger.info(f"  ✓ Migrated {self.stats['contacts_migrated']} contact(s) to '{addressbook_name}'")
+            self.logger.info(f"  ✓ Migrated {self.stats['contacts_migrated']} contact(s) to '{dest_addressbook_name}'")
                 
         except Exception as e:
             self.logger.error(f"  Failed to retrieve contacts: {str(e)}")
